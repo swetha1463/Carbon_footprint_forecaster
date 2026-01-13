@@ -1,0 +1,354 @@
+"""Hybrid TCN-Attention-XGBoost model for carbon footprint forecasting."""
+
+import numpy as np
+import xgboost as xgb
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.multioutput import MultiOutputRegressor
+import joblib
+import torch
+from typing import Tuple, Dict
+import warnings
+warnings.filterwarnings('ignore')
+
+from .attention_module import AttentionWeighter
+from .tcn_module import TCNFeatureExtractor
+
+
+class HybridCarbonForecaster(BaseEstimator, RegressorMixin):
+    """Hybrid model combining TCN, Attention, and XGBoost."""
+    
+    def __init__(self, 
+                 num_features: int,
+                 tcn_channels: list = None,
+                 attention_hidden: int = 128,
+                 attention_heads: int = 4,
+                 xgb_params: dict = None,
+                 sequence_length: int = 30,
+                 use_tcn: bool = True,
+                 use_attention: bool = True,
+                 device: str = None):
+        """
+        Args:
+            num_features: Number of input features
+            tcn_channels: Channel sizes for TCN layers
+            attention_hidden: Hidden dimension for attention
+            attention_heads: Number of attention heads
+            xgb_params: XGBoost hyperparameters
+            sequence_length: Sequence length for TCN
+            use_tcn: Whether to use TCN features
+            use_attention: Whether to use attention weighting
+            device: Torch device
+        """
+        self.num_features = num_features
+        self.tcn_channels = tcn_channels or [64, 128, 256]
+        self.attention_hidden = attention_hidden
+        self.attention_heads = attention_heads
+        self.sequence_length = sequence_length
+        self.use_tcn = use_tcn
+        self.use_attention = use_attention
+        self.device = device
+        
+        # Default XGBoost parameters
+        self.xgb_params = xgb_params or {
+            'max_depth': 6,
+            'learning_rate': 0.05,
+            'n_estimators': 500,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'gamma': 0.1,
+            'min_child_weight': 3,
+            'objective': 'reg:squarederror',
+            'eval_metric': 'rmse',
+            'tree_method': 'hist',
+            'random_state': 42,
+        }
+        
+        # Initialize components
+        self.tcn_extractor = None
+        self.attention_weighter = None
+        self.xgb_model = None
+        
+        # Feature importance tracking
+        self.feature_importance_ = None
+        
+    def _initialize_components(self):
+        """Initialize model components."""
+        if self.use_tcn:
+            self.tcn_extractor = TCNFeatureExtractor(
+                num_features=self.num_features,
+                num_channels=self.tcn_channels,
+                sequence_length=self.sequence_length,
+                device=self.device
+            )
+        
+        if self.use_attention:
+            self.attention_weighter = AttentionWeighter(
+                input_dim=self.num_features,
+                hidden_dim=self.attention_hidden,
+                num_heads=self.attention_heads,
+                device=self.device
+            )
+        
+        self.xgb_model = xgb.XGBRegressor(**self.xgb_params)
+    
+    def fit(self, X: np.ndarray, y: np.ndarray, 
+            eval_set: Tuple[np.ndarray, np.ndarray] = None,
+            verbose: bool = False) -> 'HybridCarbonForecaster':
+        """Train the hybrid model.
+        
+        Args:
+            X: Training features (n_samples, n_features)
+            y: Target values (n_samples,)
+            eval_set: Validation set (X_val, y_val)
+            verbose: Whether to print training progress
+        
+        Returns:
+            Fitted model
+        """
+        # Initialize components
+        self._initialize_components()
+        
+        X_transformed = X.copy()
+        
+        # Step 1: TCN feature extraction
+        if self.use_tcn:
+            if verbose:
+                print("Training TCN feature extractor...")
+            X_tcn = self.tcn_extractor.fit_transform(X, y, epochs=50)
+            # Combine original and TCN features
+            X_transformed = X_transformed + 0.3 * X_tcn  # Weighted combination
+        
+        # Step 2: Attention weighting
+        if self.use_attention:
+            if verbose:
+                print("Training attention mechanism...")
+            X_transformed = self.attention_weighter.fit_transform(
+                X_transformed, y, epochs=50)
+        
+        # Step 3: XGBoost training
+        if verbose:
+            print("Training XGBoost model...")
+        
+        fit_params = {'verbose': verbose}
+        
+        if eval_set is not None:
+            X_val, y_val = eval_set
+            X_val_transformed = self._transform_features(X_val)
+            fit_params['eval_set'] = [(X_val_transformed, y_val)]
+            fit_params['early_stopping_rounds'] = 50
+        
+        self.xgb_model.fit(X_transformed, y, **fit_params)
+        
+        # Store feature importance
+        self.feature_importance_ = self.xgb_model.feature_importances_
+        
+        return self
+    
+    def _transform_features(self, X: np.ndarray) -> np.ndarray:
+        """Transform features using trained components.
+        
+        Args:
+            X: Input features
+        
+        Returns:
+            Transformed features
+        """
+        X_transformed = X.copy()
+        
+        if self.use_tcn and self.tcn_extractor is not None:
+            X_tcn = self.tcn_extractor.transform(X)
+            X_transformed = X_transformed + 0.3 * X_tcn
+        
+        if self.use_attention and self.attention_weighter is not None:
+            X_transformed = self.attention_weighter.transform(X_transformed)
+        
+        return X_transformed
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make predictions.
+        
+        Args:
+            X: Input features
+        
+        Returns:
+            Predictions
+        """
+        X_transformed = self._transform_features(X)
+        return self.xgb_model.predict(X_transformed)
+    
+    def predict_multi_step(self, X: np.ndarray, steps: int = 7) -> np.ndarray:
+        """Make multi-step ahead predictions.
+        
+        Args:
+            X: Input features for the last known point
+            steps: Number of steps to predict ahead
+        
+        Returns:
+            Multi-step predictions
+        """
+        predictions = []
+        current_features = X[-1:].copy()
+        
+        for _ in range(steps):
+            pred = self.predict(current_features)[0]
+            predictions.append(pred)
+            
+            # Update features for next prediction
+            # This is a simplified version; in practice, you'd update all features
+            current_features = np.roll(current_features, -1, axis=0)
+            current_features[0, 0] = pred  # Update with prediction
+        
+        return np.array(predictions)
+    
+    def get_feature_importance(self) -> Dict[str, float]:
+        """Get feature importance scores.
+        
+        Returns:
+            Dictionary of feature names and importance scores
+        """
+        if self.feature_importance_ is None:
+            return {}
+        
+        return dict(enumerate(self.feature_importance_))
+    
+    def save(self, filepath: str):
+        """Save model to file.
+        
+        Args:
+            filepath: Path to save model
+        """
+        model_dict = {
+            'params': {
+                'num_features': self.num_features,
+                'tcn_channels': self.tcn_channels,
+                'attention_hidden': self.attention_hidden,
+                'attention_heads': self.attention_heads,
+                'sequence_length': self.sequence_length,
+                'use_tcn': self.use_tcn,
+                'use_attention': self.use_attention,
+                'xgb_params': self.xgb_params,
+            },
+            'xgb_model': self.xgb_model,
+            'feature_importance': self.feature_importance_,
+        }
+        
+        # Save PyTorch models separately as state dicts
+        if self.use_tcn and self.tcn_extractor is not None:
+            model_dict['tcn_state'] = {
+                'model_state': self.tcn_extractor.model.state_dict(),
+                'projection_state': self.tcn_extractor.projection.state_dict(),
+                'is_fitted': self.tcn_extractor.is_fitted,
+                'device': str(self.tcn_extractor.device),
+                'num_features': self.tcn_extractor.num_features,
+                'sequence_length': self.tcn_extractor.sequence_length,
+                'output_dim': self.tcn_extractor.output_dim,
+            }
+        
+        if self.use_attention and self.attention_weighter is not None:
+            model_dict['attention_state'] = {
+                'model_state': self.attention_weighter.model.state_dict(),
+                'trained': self.attention_weighter.trained,
+                'device': str(self.attention_weighter.device),
+            }
+        
+        joblib.dump(model_dict, filepath)
+    
+    @classmethod
+    def load(cls, filepath: str) -> 'HybridCarbonForecaster':
+        """Load model from file.
+        
+        Args:
+            filepath: Path to load model from
+        
+        Returns:
+            Loaded model
+        """
+        model_dict = joblib.load(filepath)
+        
+        # Create new model instance
+        model = cls(**model_dict['params'])
+        
+        # Initialize components
+        model._initialize_components()
+        
+        # Load XGBoost model
+        model.xgb_model = model_dict['xgb_model']
+        model.feature_importance_ = model_dict['feature_importance']
+        
+        # Load TCN if it was used
+        if 'tcn_state' in model_dict and model.use_tcn:
+            tcn_state = model_dict['tcn_state']
+            model.tcn_extractor.model.load_state_dict(tcn_state['model_state'])
+            model.tcn_extractor.projection.load_state_dict(tcn_state['projection_state'])
+            model.tcn_extractor.is_fitted = tcn_state['is_fitted']
+            model.tcn_extractor.model.eval()  # Set to evaluation mode
+            model.tcn_extractor.projection.eval()
+        
+        # Load Attention if it was used
+        if 'attention_state' in model_dict and model.use_attention:
+            attn_state = model_dict['attention_state']
+            model.attention_weighter.model.load_state_dict(attn_state['model_state'])
+            model.attention_weighter.trained = attn_state['trained']
+            model.attention_weighter.model.eval()  # Set to evaluation mode
+        
+        return model
+
+
+class EnsembleForecaster:
+    """Ensemble of hybrid models for robust predictions."""
+    
+    def __init__(self, n_models: int = 3, **model_kwargs):
+        """
+        Args:
+            n_models: Number of models in ensemble
+            **model_kwargs: Arguments for HybridCarbonForecaster
+        """
+        self.n_models = n_models
+        self.model_kwargs = model_kwargs
+        self.models = []
+    
+    def fit(self, X: np.ndarray, y: np.ndarray, **fit_kwargs):
+        """Train ensemble of models.
+        
+        Args:
+            X: Training features
+            y: Target values
+            **fit_kwargs: Additional fit arguments
+        """
+        for i in range(self.n_models):
+            print(f"Training ensemble model {i+1}/{self.n_models}...")
+            
+            # Add randomness through bootstrap sampling
+            indices = np.random.choice(len(X), size=len(X), replace=True)
+            X_boot = X[indices]
+            y_boot = y[indices]
+            
+            model = HybridCarbonForecaster(**self.model_kwargs)
+            model.fit(X_boot, y_boot, **fit_kwargs)
+            self.models.append(model)
+        
+        return self
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make ensemble predictions.
+        
+        Args:
+            X: Input features
+        
+        Returns:
+            Mean predictions from ensemble
+        """
+        predictions = np.array([model.predict(X) for model in self.models])
+        return predictions.mean(axis=0)
+    
+    def predict_with_uncertainty(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Make predictions with uncertainty estimates.
+        
+        Args:
+            X: Input features
+        
+        Returns:
+            Tuple of (mean predictions, standard deviation)
+        """
+        predictions = np.array([model.predict(X) for model in self.models])
+        return predictions.mean(axis=0), predictions.std(axis=0)

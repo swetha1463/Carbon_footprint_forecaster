@@ -1,0 +1,78 @@
+# Configuration for Carbon Footprint Forecaster
+
+# Data Parameters
+data:
+  synthetic_samples: 10000
+  test_split: 0.2
+  validation_split: 0.1
+  sequence_length: 30
+  prediction_horizon: 7
+
+# Feature Engineering
+features:
+  temporal_features: true
+  lag_features: [1, 7, 14, 30]
+  rolling_windows: [7, 14, 30]
+  seasonal_features: true
+  interaction_features: true
+
+# Model Parameters
+model:
+  tcn:
+    num_channels: [64, 128, 256]
+    kernel_size: 3
+    dropout: 0.2
+  xgboost:
+    max_depth: 6
+    learning_rate: 0.05
+    n_estimators: 500
+    subsample: 0.8
+    colsample_bytree: 0.8
+  attention:
+    hidden_dim: 128
+    num_heads: 4
+
+# Training
+training:
+  batch_size: 64
+  epochs: 100
+  early_stopping_patience: 15
+  learning_rate: 0.001
+  optimizer: adam
+
+# Green Score Index
+gsi:
+  weights:
+    electricity: 0.3
+    transportation: 0.35
+    waste: 0.2
+    water: 0.15
+  benchmark_percentiles:
+    excellent: 90
+    good: 75
+    average: 50
+    poor: 25
+
+# Recommendations
+recommendations:
+  min_impact_threshold: 5.0
+  max_recommendations: 5
+  categories:
+    - electricity
+    - transportation
+    - waste_management
+    - water_usage
+    - diet
+    - consumption
+
+# Real-time Processing
+streaming:
+  buffer_size: 1000
+  update_frequency: 300
+  incremental_retrain_threshold: 500
+
+# Visualization
+dashboard:
+  refresh_rate: 5
+  chart_history_days: 90
+  forecast_days: 30
